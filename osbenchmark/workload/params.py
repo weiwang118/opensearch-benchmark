@@ -1671,6 +1671,28 @@ def bulk_data_based(num_clients, start_client_index, end_client_index, corpora, 
     return bulk_generator(chain(*readers), pipeline, original_params)
 
 
+class OffsetBulkVectorsParamSource(BulkVectorsFromDataSetParamSource):
+    def __init__(self, workload, params, **kwargs):
+        # Get user-defined starting offset
+        self.user_starting_offset = parse_int_parameter("starting_offset", params, 0)
+        super().__init__(workload, params, **kwargs)
+
+    def partition(self, partition_index, total_partitions):
+        partition = super().partition(partition_index, total_partitions)
+        # Add offset to the partition's offset
+        partition.offset += self.user_starting_offset
+        partition.current = partition.offset
+
+        # Adjust the dataset seek position
+        partition.data_set.seek(partition.offset)
+        if hasattr(partition, 'parent_data_set') and partition.parent_data_set:
+            partition.parent_data_set.seek(partition.offset)
+        if hasattr(partition, 'attributes_data_set') and partition.attributes_data_set:
+            partition.attributes_data_set.seek(partition.offset)
+
+        return partition
+
+
 class GenerateActionMetaData:
     RECENCY_SLOPE = 30
 
@@ -1907,6 +1929,8 @@ class SourceOnlyIndexDataReader(IndexDataReader):
 
 register_param_source_for_operation(workload.OperationType.Bulk, BulkIndexParamSource)
 register_param_source_for_operation(workload.OperationType.BulkVectorDataSet, BulkVectorsFromDataSetParamSource)
+# add new offset based batch ingestion
+register_param_source_for_operation(workload.OperationType.OffsetBulkVectorDataSet, OffsetBulkVectorsParamSource)
 register_param_source_for_operation(workload.OperationType.Search, SearchParamSource)
 register_param_source_for_operation(workload.OperationType.VectorSearch, VectorSearchParamSource)
 register_param_source_for_operation(workload.OperationType.CreateIndex, CreateIndexParamSource)
