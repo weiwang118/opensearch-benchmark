@@ -606,6 +606,7 @@ class OperationType(Enum):
     TrainKnnModel = 19
     DeleteKnnModel = 20
     ProduceStreamMessage = 21
+    OffsetBulkVectorDataSet = 26  # offset based batch ingestion
 
     # administrative actions
     ForceMerge = 1001

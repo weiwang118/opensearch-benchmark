@@ -63,6 +63,7 @@ def register_default_runners():
     register_runner(workload.OperationType.ScrollSearch, Query(), async_runner=True)
     register_runner(workload.OperationType.VectorSearch, Query(), async_runner=True)
     register_runner(workload.OperationType.BulkVectorDataSet, BulkVectorDataSet(), async_runner=True)
+    register_runner(workload.OperationType.OffsetBulkVectorDataSet, OffsetBulkVectorDataSet(), async_runner=True)
     register_runner(workload.OperationType.RawRequest, RawRequest(), async_runner=True)
     register_runner(workload.OperationType.Composite, Composite(), async_runner=True)
     register_runner(workload.OperationType.SubmitAsyncSearch, SubmitAsyncSearch(), async_runner=True)
@@ -861,6 +862,217 @@ class BulkVectorDataSet(Runner):
 
         raise TimeoutError("Failed to submit bulk request in specified number "
                            "of retries: {}".format(retries))
+
+    def __repr__(self, *args, **kwargs):
+        return self.NAME
+
+
+import os
+import asyncio
+import logging
+
+
+class OffsetBulkVectorDataSet(Runner):
+    """
+    Bulk inserts vector search dataset with a custom starting offset and smart retries
+    """
+
+    NAME = "offset-bulk-vector-data-set"
+
+    total_docs_requested = 0
+    total_docs_ingested = 0
+    call_count = 0
+
+    async def __call__(self, opensearch, params):
+        client_call_id = OffsetBulkVectorDataSet.call_count
+        OffsetBulkVectorDataSet.call_count += 1
+
+        size = parse_int_parameter("size", params)
+        retries = parse_int_parameter("retries", params, 0) + 5
+        initial_backoff = parse_int_parameter("initial_backoff_seconds", params, 30)
+        starting_offset = params.get("starting_offset", 0)
+
+
+        # logging to file
+        # timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # log_file_path = os.path.expanduser(f"~/bulk_vector_{timestamp}_offset_{starting_offset}.log")
+        # log_file = open(log_file_path, "w")
+
+        def log(message):
+            # remember to close log file
+            # write to file and console for debugging
+            pass
+            # log_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            # formatted = f"[{log_timestamp}][Worker-{client_identifier}] {message}"
+            # log_file.write(f"{formatted}\n")
+            # log_file.flush()  # Ensure it's written immediately
+            # print(formatted)
+
+        log(f"Starting bulk operation with size={size}, starting_offset={starting_offset}")
+
+        # Track requested documents for this client
+        OffsetBulkVectorDataSet.total_docs_requested += size
+
+        # Keep track of which documents failed and need retries
+        failed_docs = []
+        failed_429_count = 0
+        other_error_count = 0
+        successful_count = 0
+
+        # Original request body
+        original_body = params["body"]
+
+        # First attempt
+        try:
+            request_context_holder.on_client_request_start()
+            response = await opensearch.bulk(body=original_body)
+            request_context_holder.on_client_request_end()
+
+            # Process response to identify succeeded and failed documents
+            if isinstance(response, dict) and "items" in response:
+                for idx, item in enumerate(response["items"]):
+                    op_type = next(iter(item))
+                    doc_data = item[op_type]
+                    status = doc_data.get("status", 0)
+                    doc_id = doc_data.get("_id", "unknown")
+
+                    # Find corresponding position in the original body (idx*2 for action, idx*2+1 for doc)
+                    action_pos = idx * 2
+                    doc_pos = action_pos + 1
+
+                    if status >= 300:
+                        if action_pos < len(original_body) and doc_pos < len(original_body):
+                            # Store action and document for retry
+                            failed_docs.append((original_body[action_pos], original_body[doc_pos]))
+
+                            if status == 429:
+                                failed_429_count += 1
+                                log(f"Document {doc_id} failed with 429 status - adding to retry queue")
+                            else:
+                                other_error_count += 1
+                                error_type = doc_data.get("error", {}).get("type", "unknown")
+                                error_reason = doc_data.get("error", {}).get("reason", "unknown reason")
+                                log(f"Document {doc_id} failed with status {status}: {error_type} - {error_reason}")
+                    elif status < 300:  # Success codes are < 300
+                        successful_count += 1
+
+                has_errors = response.get("errors", False)
+                took_ms = response.get("took", 0)
+                item_count = len(response.get("items", []))
+
+                log(f"Bulk response: took={took_ms}ms, items={item_count}, has_errors={has_errors}")
+                log(f"Initial attempt: {successful_count} succeeded, {failed_429_count} failed with 429 errors, {other_error_count} failed with other errors")
+
+                # Calculate any missing document counts
+                expected_count = len(original_body) // 2
+                if item_count < expected_count:
+                    missing_count = expected_count - item_count
+                    log(f"WARNING: {missing_count} documents are missing from the response")
+
+                    # For safety, add all documents without a response to the retry queue
+                    for i in range(item_count, expected_count):
+                        action_pos = i * 2
+                        doc_pos = action_pos + 1
+                        if action_pos < len(original_body) and doc_pos < len(original_body):
+                            failed_docs.append((original_body[action_pos], original_body[doc_pos]))
+                            other_error_count += 1
+
+        except Exception as e:
+            log(f"Exception during bulk operation: {str(e)}")
+            # In case of exception, consider all documents as failed
+            for i in range(0, len(original_body), 2):
+                if i + 1 < len(original_body):
+                    failed_docs.append((original_body[i], original_body[i + 1]))
+            other_error_count = len(failed_docs)
+
+        # Retry loop for failed documents
+        retry_count = 0
+        backoff_time = initial_backoff
+
+        while failed_docs and retry_count < retries:
+            retry_count += 1
+            log(f"Waiting {backoff_time} seconds before retry #{retry_count}...")
+            await asyncio.sleep(backoff_time)
+
+            # Prepare retry batch with only the failed documents
+            retry_body = []
+            for action, doc in failed_docs:
+                retry_body.append(action)
+                retry_body.append(doc)
+
+            log(f"Retry #{retry_count}: Attempting to ingest {len(failed_docs)} previously failed documents")
+
+            # Clear the failed items list for this retry
+            current_failed = failed_docs
+            failed_docs = []
+            retry_429_count = 0
+            retry_other_count = 0
+
+            try:
+                request_context_holder.on_client_request_start()
+                retry_response = await opensearch.bulk(body=retry_body)
+                request_context_holder.on_client_request_end()
+
+                # Process retry response
+                retry_success_count = 0
+                if isinstance(retry_response, dict) and "items" in retry_response:
+                    for idx, item in enumerate(retry_response["items"]):
+                        op_type = next(iter(item))
+                        doc_data = item[op_type]
+                        status = doc_data.get("status", 0)
+                        doc_id = doc_data.get("_id", "unknown")
+
+                        if status >= 300:  # Any error
+                            # Add back to failed docs for next retry
+                            if idx < len(current_failed):
+                                failed_docs.append(current_failed[idx])
+
+                                if status == 429:
+                                    retry_429_count += 1
+                                else:
+                                    retry_other_count += 1
+                                    error_type = doc_data.get("error", {}).get("type", "unknown")
+                                    error_reason = doc_data.get("error", {}).get("reason", "unknown reason")
+                                    log(f"Document {doc_id} still failing with status {status}: {error_type} - {error_reason}")
+                        elif status < 300:  # Success
+                            retry_success_count += 1
+
+                took_ms = retry_response.get("took", 0)
+                item_count = len(retry_response.get("items", []))
+                has_errors = retry_response.get("errors", False)
+
+                log(f"Retry response: took={took_ms}ms, items={item_count}, has_errors={has_errors}")
+                log(f"Retry #{retry_count} result: {retry_success_count} succeeded, {retry_429_count} failed with 429 errors, {retry_other_count} failed with other errors")
+                successful_count += retry_success_count
+
+                # Increase backoff for next retry (exponential backoff)
+                backoff_time = min(backoff_time * 2, 300)  # Cap at 5 minutes
+            except Exception as e:
+                log(f"Exception during retry #{retry_count}: {str(e)}")
+                # On exception, keep all current failed docs for next retry
+                failed_docs = current_failed
+                # Increase backoff more aggressively on exception
+                backoff_time = min(backoff_time * 3, 600)  # Cap at 10 minutes
+
+        # Final count
+        OffsetBulkVectorDataSet.total_docs_ingested += successful_count
+
+        # Calculate final docs ingested
+        failed_count = len(failed_docs)
+        if failed_count > 0:
+            log(f"WARNING: {failed_count} documents could not be indexed after {retry_count + 1} attempts")
+
+
+        if successful_count + failed_count != size:
+            discrepancy = size - (successful_count + failed_count)
+            log(f"DOCUMENT COUNT DISCREPANCY: {discrepancy} documents are unaccounted for")
+
+        log(f"Batch complete: {successful_count}/{size} documents successfully indexed")
+        log(f"Total progress: {OffsetBulkVectorDataSet.total_docs_ingested}/{OffsetBulkVectorDataSet.total_docs_requested} documents")
+
+
+        # Return only the count of successfully indexed documents
+        return successful_count, "docs"
 
     def __repr__(self, *args, **kwargs):
         return self.NAME
