@@ -40,7 +40,7 @@ import numpy as np
 from osbenchmark import exceptions
 from osbenchmark.utils import io
 from osbenchmark.utils.dataset import DataSet, get_data_set, Context
-from osbenchmark.utils.parse import parse_string_parameter, parse_int_parameter
+from osbenchmark.utils.parse import parse_string_parameter, parse_int_parameter, parse_bool_parameter
 from osbenchmark.workload import workload
 from osbenchmark.workload import loader
 
@@ -1070,6 +1070,7 @@ class VectorSearchPartitionParamSource(VectorDataSetPartitionParamSource):
     PARAMS_NAME_FILTER_TYPE = "filter_type"
     PARAMS_NAME_FILTER_BODY = "filter_body"
     PARAMS_NAME_REPETITIONS = "repetitions"
+    PARAMS_NAME_RESCORE_ENABLED = "rescore"
     PARAMS_NAME_RESCORE_OVERSAMPLE_FACTOR = "rescore_oversample_factor"
     PARAMS_NAME_NEIGHBORS_DATA_SET_FORMAT = "neighbors_data_set_format"
     PARAMS_NAME_NEIGHBORS_DATA_SET_PATH = "neighbors_data_set_path"
@@ -1087,6 +1088,7 @@ class VectorSearchPartitionParamSource(VectorDataSetPartitionParamSource):
         self.k = parse_int_parameter(self.PARAMS_NAME_K, params)
         self.repetitions = parse_int_parameter(self.PARAMS_NAME_REPETITIONS, params, 1)
         self.rescore_oversample_factor = parse_int_parameter(self.PARAMS_NAME_RESCORE_OVERSAMPLE_FACTOR, params)
+        self.rescore_enabled = parse_bool_parameter(self.PARAMS_NAME_RESCORE_ENABLED, params)
         self.current_rep = 1
         self.neighbors_data_set_format = parse_string_parameter(
             self.PARAMS_NAME_NEIGHBORS_DATA_SET_FORMAT, params, self.data_set_format)
@@ -1100,6 +1102,7 @@ class VectorSearchPartitionParamSource(VectorDataSetPartitionParamSource):
         self.query_params.update({
             self.PARAMS_NAME_K: self.k,
             self.PARAMS_NAME_RESCORE_OVERSAMPLE_FACTOR: self.rescore_oversample_factor,
+            self.PARAMS_NAME_RESCORE_ENABLED: self.rescore_enabled,
             self.PARAMS_NAME_OPERATION_TYPE: operation_type,
             self.PARAMS_NAME_ID_FIELD_NAME: params.get(self.PARAMS_NAME_ID_FIELD_NAME),
         })
@@ -1214,6 +1217,13 @@ class VectorSearchPartitionParamSource(VectorDataSetPartitionParamSource):
               "oversample_factor": self.rescore_oversample_factor
             }
         }
+
+        if self.rescore_enabled:
+            query["rescore"] = {
+                "oversample_factor": self.rescore_oversample_factor
+            }
+        else:
+            query["rescore"] = False
 
         if efficient_filter:
             query.update({
